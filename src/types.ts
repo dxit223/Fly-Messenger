@@ -3,6 +3,7 @@ export interface User {
   username: string;
   publicKey?: string;
   avatarUrl?: string;
+  lastSeen?: string;
 }
 
 export interface Attachment {
@@ -19,6 +20,7 @@ export interface Message {
   isEncrypted: boolean;
   timestamp: string;
   attachment?: Attachment;
+  replyToId?: number;
 }
 
 export interface TokenDecoded {

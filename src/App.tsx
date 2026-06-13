@@ -3,12 +3,25 @@ import { io, Socket } from 'socket.io-client';
 import { 
   Shield, Key, Users, MessageSquare, Send, ArrowLeft, LogOut, Loader2, 
   Lock, Unlock, Trash2, Paperclip, Image as ImageIcon, Mic, Square, X, 
-  FileText, Activity, Server as ServerIcon, RefreshCw, Settings, Camera
+  FileText, Activity, Server as ServerIcon, RefreshCw, Settings, Camera,
+  Search, UserPlus, Forward, Reply
 } from 'lucide-react';
 import { encryptMessage, decryptMessage } from './crypto';
 import type { User, Message, Attachment } from './types';
 
 type View = 'login' | 'admin_login' | 'admin_panel' | 'contacts' | 'chat' | 'profile';
+
+const timeAgo = (isoTime?: string) => {
+  if (!isoTime) return 'Offline';
+  const diffInSeconds = Math.floor((Date.now() - new Date(isoTime).getTime()) / 1000);
+  if (diffInSeconds < 60) return `Seen just now`;
+  const diffInMins = Math.floor(diffInSeconds / 60);
+  if (diffInMins < 60) return `Seen ${diffInMins} min ago`;
+  const diffInHours = Math.floor(diffInMins / 60);
+  if (diffInHours < 24) return `Seen ${diffInHours} hours ago`;
+  const diffInDays = Math.floor(diffInHours / 24);
+  return `Seen ${diffInDays} days ago`;
+};
 
 export default function App() {
   const [view, setView] = useState<View>('login');
@@ -27,6 +40,9 @@ export default function App() {
   // Admin panel state
   const [adminUsers, setAdminUsers] = useState<User[]>([]);
   const [adminStats, setAdminStats] = useState({ totalUsers: 0, totalMessages: 0, activeConnections: 0 });
+  const [chatU1, setChatU1] = useState<number | ''>('');
+  const [chatU2, setChatU2] = useState<number | ''>('');
+  const [adminViewChats, setAdminViewChats] = useState<{ id: number, sender: string, content: string, time: string }[] | null>(null);
 
   // User chat state
   const [contacts, setContacts] = useState<User[]>([]);
@@ -35,9 +51,13 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [encryptionEnabled, setEncryptionEnabled] = useState(true);
   
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<User[]>([]);
+
   const [newMessage, setNewMessage] = useState('');
   const [attachment, setAttachment] = useState<Attachment | null>(null);
   const [isRecording, setIsRecording] = useState(false);
+  const [replyingTo, setReplyingTo] = useState<Message | null>(null);
   
   const [decryptedMessages, setDecryptedMessages] = useState<Record<number, string>>({});
   const [decryptedAttachments, setDecryptedAttachments] = useState<Record<number, Attachment>>({});
@@ -53,7 +73,6 @@ export default function App() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<BlobPart[]>([]);
 
-  // Logout handler
   const logout = () => {
     localStorage.removeItem('fly_token');
     setToken(null);
@@ -62,7 +81,6 @@ export default function App() {
     if (socketRef.current) socketRef.current.disconnect();
   };
 
-  // Initialize socket when token changes and it's a regular user
   useEffect(() => {
     if (token && view.includes('chat') || view === 'contacts') {
       const socket = io({
@@ -71,25 +89,37 @@ export default function App() {
       socketRef.current = socket;
 
       socket.on('users:online', (userIds: number[]) => setOnlineUsers(userIds));
-      socket.on('user:status', ({ userId, status }) => {
+      socket.on('user:status', ({ userId, status, lastSeen }) => {
         setOnlineUsers(prev => status === 'online' ? [...prev, userId] : prev.filter(id => id !== userId));
+        setContacts(prev => prev.map(c => c.id === userId ? { ...c, lastSeen } : c));
+        if (activeChat?.id === userId) {
+           setActiveChat(prev => prev ? { ...prev, lastSeen } : prev);
+        }
       });
       socket.on('message:receive', (msg: Message) => {
         setMessages(prev => [...prev, msg]);
       });
       socket.on('message:sent', (msg: Message) => {
         setMessages(prev => {
-          // Remove any stray optimistic messages (negative IDs) just in case
           const clean = prev.filter(m => m.id > 0);
           return [...clean, msg];
         });
+      });
+      socket.on('message:deleted', (msgId: number) => {
+        setMessages(prev => prev.filter(m => m.id !== msgId));
       });
 
       return () => { socket.disconnect(); };
     }
   }, [token, view]);
 
-  // Load data depending on view
+  const fetchContacts = () => {
+      fetch('/api/users/contacts', { headers: { Authorization: `Bearer ${token}` } })
+        .then(res => res.json())
+        .then(data => setContacts(data))
+        .catch(() => logout());
+  }
+
   const loadAdminData = () => {
     if (!token) return;
     fetch('/api/admin/users', { headers: { Authorization: `Bearer ${token}` } })
@@ -109,14 +139,20 @@ export default function App() {
       const interval = setInterval(loadAdminData, 5000);
       return () => clearInterval(interval);
     } else if (view === 'contacts') {
-      fetch('/api/users/contacts', { headers: { Authorization: `Bearer ${token}` } })
-        .then(res => res.json())
-        .then(data => setContacts(data))
-        .catch(() => logout());
+      fetchContacts();
     }
   }, [token, view]);
+  
+  useEffect(() => {
+    if (searchQuery.trim().length > 0 && token) {
+        fetch(`/api/users/search?q=${encodeURIComponent(searchQuery)}`, { headers: { Authorization: `Bearer ${token}` } })
+          .then(res => res.json())
+          .then(setSearchResults);
+    } else {
+      setSearchResults([]);
+    }
+  }, [searchQuery, token]);
 
-  // Load chat messages when opening a chat
   useEffect(() => {
     if (view === 'chat' && activeChat && token) {
       setMessages([]);
@@ -129,6 +165,7 @@ export default function App() {
       
       setAttachment(null);
       setNewMessage('');
+      setReplyingTo(null);
     }
   }, [view, activeChat, token]);
 
@@ -243,6 +280,42 @@ export default function App() {
       loadAdminData();
     } catch (e) {}
   };
+  
+  const handleClearAdminChat = async () => {
+      if (!chatU1 || !chatU2) return;
+      if (!confirm('Clear specific chat between these two users?')) return;
+      try {
+        await fetch(`/api/admin/chats/${chatU1}/${chatU2}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+        setChatU1(''); setChatU2('');
+        setAdminViewChats(null);
+        loadAdminData();
+        alert('Chat cleared.');
+      } catch(e) {}
+   };
+
+  const handleFetchAdminChat = async () => {
+      if (!chatU1 || !chatU2) return;
+      try {
+        const res = await fetch(`/api/admin/chats/${chatU1}/${chatU2}`, { headers: { Authorization: `Bearer ${token}` } });
+        const data: Message[] = await res.json();
+        
+        // Decrypt using deterministic key
+        const derivedSecret = `auto_secret_v1_${Math.min(chatU1 as number, chatU2 as number)}_${Math.max(chatU1 as number, chatU2 as number)}`;
+        const u1Obj = adminUsers.find(u => u.id === chatU1);
+        const u2Obj = adminUsers.find(u => u.id === chatU2);
+        
+        const decryptedList = await Promise.all(data.map(async m => {
+           let content = m.content;
+           if (m.isEncrypted) {
+               try { content = await decryptMessage(m.content, derivedSecret); } catch(e) { content = '[Encrypted Message]'; }
+           }
+           const senderName = m.senderId === chatU1 ? u1Obj?.username : u2Obj?.username;
+           return { id: m.id, sender: senderName || 'Unknown', content, time: new Date(m.timestamp).toLocaleTimeString() };
+        }));
+        
+        setAdminViewChats(decryptedList);
+      } catch(e) { alert('Failed to fetch chat logs'); }
+  };
 
   const handleChangeAdminPassword = async (e: React.FormEvent) => {
      e.preventDefault(); setError('');
@@ -266,6 +339,15 @@ export default function App() {
          });
          if (res.ok) alert('User password reset successfully');
       } catch (e) {}
+  };
+
+  const handleAddContact = async (contactId: number) => {
+     await fetch('/api/users/contacts', {
+         method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+         body: JSON.stringify({ contactId })
+     });
+     setSearchQuery('');
+     fetchContacts();
   };
 
   const handleUpdateProfilePassword = async (e: React.FormEvent) => {
@@ -390,8 +472,21 @@ export default function App() {
       receiverId: activeChat.id,
       content: finalContent,
       isEncrypted: encryptionEnabled,
-      attachment: attachmentPayload
+      attachment: attachmentPayload,
+      replyToId: replyingTo?.id
     });
+    setReplyingTo(null);
+  };
+
+  const handleDeleteMessage = async (id: number) => {
+     if (!confirm('Delete message for everyone?')) return;
+     await fetch(`/api/users/messages/${id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+  };
+  
+  const handleForwardMessage = (msg: Message) => {
+    const text = decryptedMessages[msg.id];
+    if (text) setNewMessage(`[Forwarded]: ${text}`);
+    if (decryptedAttachments[msg.id]) setAttachment(decryptedAttachments[msg.id]);
   };
 
   // UI Renderers...
@@ -526,9 +621,52 @@ export default function App() {
                     </button>
                  </form>
               </div>
+
+              <div className="bg-neutral-900 rounded-2xl border border-neutral-800 p-6 mt-6">
+                 <h2 className="text-lg font-medium mb-4 flex items-center space-x-2">
+                   <Trash2 className="h-5 w-5 text-neutral-400" /> <span>Manage Specific Chat</span>
+                 </h2>
+                 <div className="space-y-3 mb-4 text-black">
+                    <select value={chatU1} onChange={e => setChatU1(parseInt(e.target.value) || '')} className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm focus:outline-none text-white">
+                       <option value="">Select User 1</option>
+                       {adminUsers.map(u => <option key={u.id} value={u.id}>{u.username}</option>)}
+                    </select>
+                    <select value={chatU2} onChange={e => setChatU2(parseInt(e.target.value) || '')} className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm focus:outline-none text-white">
+                       <option value="">Select User 2</option>
+                       {adminUsers.map(u => <option key={u.id} value={u.id}>{u.username}</option>)}
+                    </select>
+                 </div>
+                 <div className="flex space-x-2">
+                   <button onClick={handleFetchAdminChat} disabled={!chatU1 || !chatU2} className="w-full bg-neutral-800 hover:bg-neutral-700 text-white rounded-lg py-2 text-sm font-medium transition-colors disabled:opacity-50">
+                      View Logs
+                   </button>
+                   <button onClick={handleClearAdminChat} disabled={!chatU1 || !chatU2} className="w-full bg-red-600 hover:bg-red-700 text-white rounded-lg py-2 text-sm font-medium transition-colors disabled:opacity-50">
+                      Wipe History
+                   </button>
+                 </div>
+              </div>
             </div>
 
-            <div className="md:col-span-2">
+            <div className="md:col-span-2 space-y-6">
+              
+              {adminViewChats && (
+                 <div className="bg-neutral-900 rounded-2xl border border-neutral-800 overflow-hidden flex flex-col max-h-96">
+                   <div className="px-6 py-4 border-b border-neutral-800 bg-neutral-800/50 flex justify-between items-center">
+                     <h2 className="text-lg font-medium">Decrypted Chat Logs</h2>
+                     <button onClick={() => setAdminViewChats(null)} className="text-neutral-400 hover:text-white p-1"><X className="h-4 w-4" /></button>
+                   </div>
+                   <div className="flex-1 overflow-y-auto p-4 space-y-2">
+                      {adminViewChats.length === 0 ? <p className="text-sm text-neutral-500 text-center py-4">No messages found between these users.</p> : null}
+                      {adminViewChats.map(m => (
+                         <div key={m.id} className="bg-neutral-950 border border-neutral-800 rounded p-2 text-sm">
+                            <span className="font-bold text-blue-400">{m.sender}</span> <span className="text-neutral-500 text-xs ml-2">{m.time}</span>
+                            <p className="mt-1 break-words">{m.content}</p>
+                         </div>
+                      ))}
+                   </div>
+                 </div>
+              )}
+
               <div className="bg-neutral-900 rounded-2xl border border-neutral-800 overflow-hidden">
                 <div className="px-6 py-4 border-b border-neutral-800 bg-neutral-800/50 flex justify-between items-center">
                   <h2 className="text-lg font-medium">Active Identities</h2>
@@ -578,36 +716,64 @@ export default function App() {
             </div>
           </header>
           
-          <div className="flex-1 overflow-y-auto px-4 py-4 space-y-2">
-            <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider mb-4 px-2">Network Contacts</h2>
-            {contacts.map(c => {
-              const isOnline = onlineUsers.includes(c.id);
-              return (
-                <button key={c.id} onClick={() => { setActiveChat(c); setView('chat'); }}
-                  className="w-full flex items-center space-x-4 p-3 rounded-xl hover:bg-neutral-800/80 transition-all text-left group"
-                >
-                  <div className="relative">
-                    {c.avatarUrl ? (
-                      <div className="h-12 w-12 rounded-full overflow-hidden border border-neutral-800"><img src={c.avatarUrl} className="w-full h-full object-cover" /></div>
-                    ) : (
-                      <div className="h-12 w-12 bg-neutral-800 rounded-full flex items-center justify-center text-neutral-300 font-medium group-hover:bg-neutral-700 transition-colors">
-                        {c.username.substring(0, 2).toUpperCase()}
-                      </div>
-                    )}
-                    <div className={`absolute bottom-0 right-0 h-3.5 w-3.5 rounded-full border-2 border-neutral-900 ${isOnline ? 'bg-green-500' : 'bg-neutral-600'}`}></div>
-                  </div>
-                  <div className="flex-1">
-                    <div className="text-sm font-medium text-neutral-200">{c.username}</div>
-                  </div>
-                </button>
-              );
+          <div className="flex-1 overflow-y-auto pt-4 pb-4 space-y-2">
+            <div className="px-4 mb-4">
+               <div className="relative">
+                 <Search className="h-4 w-4 absolute left-3 top-2.5 text-neutral-500" />
+                 <input type="text" placeholder="Search usernames to add..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
+                   className="w-full bg-neutral-950 border border-neutral-800 rounded-lg pl-9 pr-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none" />
+               </div>
+            </div>
+            
+            <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider mb-2 px-6">
+               {searchQuery ? 'Search Results' : 'Network Contacts'}
+            </h2>
+            
+            <div className="px-4 space-y-2">
+            {(searchQuery ? searchResults : contacts).map(c => {
+               const isOnline = onlineUsers.includes(c.id);
+               return (
+                 <div key={c.id} className="flex items-center space-x-2">
+                   <button onClick={() => {
+                        if (searchQuery) return; // Prevent raw click on search results
+                        setActiveChat(c); setView('chat'); 
+                     }}
+                     className={`flex-1 flex items-center space-x-4 p-3 rounded-xl transition-all text-left group ${!searchQuery ? 'hover:bg-neutral-800/80 cursor-pointer' : ''}`}
+                   >
+                     <div className="relative">
+                       {c.avatarUrl ? (
+                         <div className="h-12 w-12 rounded-full overflow-hidden border border-neutral-800"><img src={c.avatarUrl} className="w-full h-full object-cover" /></div>
+                       ) : (
+                         <div className="h-12 w-12 bg-neutral-800 rounded-full flex items-center justify-center text-neutral-300 font-medium group-hover:bg-neutral-700 transition-colors">
+                           {c.username.substring(0, 2).toUpperCase()}
+                         </div>
+                       )}
+                       <div className={`absolute bottom-0 right-0 h-3.5 w-3.5 rounded-full border-2 border-neutral-900 ${isOnline ? 'bg-green-500' : 'bg-neutral-600'}`}></div>
+                     </div>
+                     <div className="flex-1">
+                       <div className="text-sm font-medium text-neutral-200">{c.username}</div>
+                       {!searchQuery && <div className="text-xs text-neutral-500 mt-0.5">{isOnline ? 'Online' : timeAgo(c.lastSeen)}</div>}
+                     </div>
+                   </button>
+                   {searchQuery && (
+                      <button onClick={() => handleAddContact(c.id)} className="p-2 ml-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors">
+                        <UserPlus className="h-4 w-4" />
+                      </button>
+                   )}
+                 </div>
+               );
             })}
-            {contacts.length === 0 && (
+            
+            {!searchQuery && contacts.length === 0 && (
               <div className="text-center py-12 px-4 shadow-inner bg-neutral-900/50 rounded-2xl border border-neutral-800/50">
                 <Users className="h-8 w-8 text-neutral-600 mx-auto mb-3" />
-                <p className="text-sm text-neutral-400">Awaiting peer provisioning...</p>
+                <p className="text-sm text-neutral-400">Search for a username above to start chatting.</p>
               </div>
             )}
+            {searchQuery && searchResults.length === 0 && (
+              <div className="text-center py-8 text-sm text-neutral-500">No users found for "{searchQuery}".</div>
+            )}
+            </div>
           </div>
         </div>
       </div>
@@ -634,7 +800,7 @@ export default function App() {
                 <h2 className="font-medium text-white">{activeChat.username}</h2>
                 <div className="text-xs text-neutral-400 flex items-center space-x-1.5 mt-0.5">
                   <div className={`h-2 w-2 rounded-full ${onlineUsers.includes(activeChat.id) ? 'bg-green-500' : 'bg-neutral-600'}`}></div>
-                  <span>{onlineUsers.includes(activeChat.id) ? 'Online' : 'Offline'}</span>
+                  <span>{onlineUsers.includes(activeChat.id) ? 'Online' : timeAgo(activeChat.lastSeen)}</span>
                 </div>
               </div>
             </div>
@@ -661,14 +827,40 @@ export default function App() {
               const decrypted = decryptedMessages[msg.id];
               const att = decryptedAttachments[msg.id];
               const failed = decrypted === "[Encrypted Message - Invalid Secret]";
+              
+              const repliedMsg = msg.replyToId ? messages.find(m => m.id === msg.replyToId) : null;
+              const repliedText = repliedMsg ? decryptedMessages[repliedMsg.id] : null;
 
               return (
-                <div key={msg.id} className={`flex ${isMine ? 'justify-end' : 'justify-start'}`}>
-                  <div className={`max-w-[85%] rounded-2xl px-5 py-3 ${
+                <div key={msg.id} className={`flex ${isMine ? 'justify-end' : 'justify-start'} group relative`}>
+                  
+                  {/* Actions Tooltip / Buttons */}
+                  <div className={`absolute top-1/2 -translate-y-1/2 flex items-center space-x-1 opacity-0 group-hover:opacity-100 transition-opacity ${isMine ? 'right-[calc(100%+8px)]' : 'left-[calc(100%+8px)]'}`}>
+                     <button onClick={() => setReplyingTo(msg)} className="p-1.5 text-neutral-500 hover:text-white bg-neutral-900 rounded border border-neutral-800 shadow-sm" title="Reply">
+                        <Reply className="h-3.5 w-3.5" />
+                     </button>
+                     <button onClick={() => handleForwardMessage(msg)} className="p-1.5 text-neutral-500 hover:text-white bg-neutral-900 rounded border border-neutral-800 shadow-sm" title="Forward">
+                        <Forward className="h-3.5 w-3.5" />
+                     </button>
+                     {isMine && (
+                       <button onClick={() => handleDeleteMessage(msg.id)} className="p-1.5 text-neutral-500 hover:text-red-500 bg-neutral-900 rounded border border-neutral-800 shadow-sm" title="Delete">
+                          <Trash2 className="h-3.5 w-3.5" />
+                       </button>
+                     )}
+                  </div>
+
+                  <div className={`max-w-[80%] rounded-2xl px-5 py-3 ${
                     isMine 
                       ? 'bg-blue-600 text-white rounded-br-none shadow-blue-900/20 shadow-lg' 
                       : 'bg-neutral-800 text-neutral-100 rounded-bl-none border border-neutral-700/50'
                   } ${failed ? 'bg-red-900/50 border-red-500/50 text-red-200' : ''}`}>
+                    
+                    {msg.replyToId && (
+                       <div className="mb-2 p-2 bg-black/20 rounded-lg text-xs border-l-2 border-white/30 truncate">
+                          <div className="opacity-70 mb-0.5">{repliedMsg?.senderId === user?.id ? 'You' : activeChat.username}</div>
+                          <div className="opacity-90">{repliedText || repliedMsg?.attachment?.name || 'Message'}</div>
+                       </div>
+                    )}
                     
                     {msg.isEncrypted && !failed && (
                        <Lock className={`h-3 w-3 mb-1.5 opacity-40 ${isMine ? 'text-blue-200' : 'text-neutral-400'}`} />
@@ -701,6 +893,18 @@ export default function App() {
             <div ref={messagesEndRef} />
         </div>
         
+        {replyingTo && (
+           <div className="max-w-3xl mx-auto w-full px-4 pt-2">
+             <div className="bg-neutral-800 border-l-4 border-blue-500 rounded-lg p-3 flex items-center justify-between">
+                <div className="overflow-hidden">
+                   <div className="text-xs text-blue-400 font-medium mb-0.5">Replying to {replyingTo.senderId === user?.id ? 'Yourself' : activeChat.username}</div>
+                   <div className="text-sm text-neutral-300 truncate">{decryptedMessages[replyingTo.id] || replyingTo.attachment?.name || 'Message'}</div>
+                </div>
+                <button onClick={() => setReplyingTo(null)} className="text-neutral-400 hover:text-white"><X className="h-4 w-4" /></button>
+             </div>
+           </div>
+        )}
+
         {attachment && (
             <div className="max-w-3xl mx-auto w-full px-4 pt-2">
               <div className="bg-neutral-800 border border-neutral-700 rounded-lg p-3 flex items-center justify-between">
