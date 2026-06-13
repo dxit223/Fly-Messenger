@@ -78,7 +78,11 @@ export default function App() {
         setMessages(prev => [...prev, msg]);
       });
       socket.on('message:sent', (msg: Message) => {
-        setMessages(prev => [...prev.filter(m => m.id !== -1), msg]);
+        setMessages(prev => {
+          // Remove any stray optimistic messages (negative IDs) just in case
+          const clean = prev.filter(m => m.id > 0);
+          return [...clean, msg];
+        });
       });
 
       return () => { socket.disconnect(); };
@@ -388,18 +392,6 @@ export default function App() {
       isEncrypted: encryptionEnabled,
       attachment: attachmentPayload
     });
-
-    const tempId = -Math.random();
-    setMessages(prev => [...prev, {
-      id: tempId, senderId: user.id, receiverId: activeChat.id,
-      content: finalContent, isEncrypted: encryptionEnabled,
-      attachment: attachmentPayload, timestamp: new Date().toISOString()
-    }]);
-    
-    setDecryptedMessages(prev => ({ ...prev, [tempId]: plainText || ' ' }));
-    if (currentAttachment) {
-      setDecryptedAttachments(prev => ({ ...prev, [tempId]: currentAttachment }));
-    }
   };
 
   // UI Renderers...
